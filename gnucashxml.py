@@ -31,15 +31,16 @@ class Book(object):
     A book is the main container for GNU Cash data.
 
     It doesn't really do anything at all by itself, except to have
-    a reference to the accounts, transactions, and commodities.
+    a reference to the accounts, transactions, commodities, and price DB.
     """
     def __init__(self, guid, transactions=None, root_account=None,
-                 commodities=None, slots=None):
+                 commodities=None, slots=None, pricedb=None):
         self.guid = guid
         self.transactions = transactions or []
         self.root_account = root_account
         self.commodities = commodities or []
         self.slots = slots or {}
+        self.pricedb = pricedb or PriceDB()
 
     def __repr__(self):
         return "<Book {}>".format(self.guid)
@@ -191,6 +192,72 @@ class Split(object):
             False
 
 
+class PriceDB(object):
+    """
+    A PriceDB contains a collection of prices.
+    """
+    def __init__(self):
+        self.prices = []
+
+    def add_price(self, price):
+        self.prices.append(price)
+
+    def get_prices(self, commodity, currency=None):
+        if currency and commodity.name == currency.name:
+            return [Price(commodity, currency, None, 'self:equivalent', 1)]
+        prices = [price for price in self.prices
+                if price.commodity == commodity
+                and (currency is None or price.currency == currency)]
+        if prices:
+            return prices
+        else:
+            prices = [price for price in self.prices
+                    if price.commodity == commodity]
+            adjusted_prices = []
+            for price in prices:
+                currency = price.currency
+                currency_price = self.get_latest_price(currency)
+                if currency_price:
+                    adjusted_prices.append(Price(commodity, currency, price.date, price.source, price.value * currency_price.value))
+            return adjusted_prices
+
+    def get_latest_price(self, commodity, currency=None):
+        prices = self.get_prices(commodity, currency=currency)
+        prices.sort(key=lambda price: price.date)
+        return prices[-1]
+    
+    def get_latest_price_before_or_eq_to_date(self, commodity, currency=None, date=None):
+        if commodity.name == currency.name:
+            return Price(commodity, currency, None, 'self:equivalent', 1)
+        prices = self.get_prices(commodity, currency=currency)
+        # sort prices on date, descending
+        prices.sort(key=lambda price: price.date, reverse=True)
+        # find the first price that is before the date
+        for price in prices:
+            if price.date.date() <= date:
+                return price
+        return None
+
+    def __repr__(self):
+        return "<PriceDB {} prices>".format(len(self.prices))
+
+
+class Price(object):
+    """
+    A price is a price for a commodity at a given time.
+    """
+    def __init__(self, commodity, currency, date, source, value):
+        self.commodity = commodity
+        self.currency = currency
+        self.date = date
+        self.source = source
+        self.value = value
+
+    def __repr__(self):
+        return "<Price {} {} {}>".format(self.commodity, self.value,
+                                         self.currency)
+
+
 
 ##################################################################
 # XML file parsing
@@ -266,11 +333,16 @@ def _book_from_tree(tree):
 
     slots = _slots_from_tree(
         tree.find('{http://www.gnucash.org/XML/book}slots'))
+
+    pricedb = _pricedb_from_tree(
+        tree.find('{http://www.gnucash.org/XML/gnc}pricedb'),
+        commoditydict)
     return Book(guid=guid,
                 transactions=transactions,
                 root_account=root_account,
                 commodities=commodities,
-                slots=slots)
+                slots=slots,
+                pricedb=pricedb)
 
 
 # Implemented:
@@ -440,6 +512,41 @@ def _slots_from_tree(tree):
         else:
             raise RuntimeError("Unknown slot type {}".format(type_))
     return slots
+
+# Implemented:
+# - price:commodity
+# - price:currency
+# - price:time
+# - price:source
+# - price:value
+def _pricedb_from_tree(tree, commoditydict):
+    gnc = '{http://www.gnucash.org/XML/gnc}'
+    price = '{http://www.gnucash.org/XML/price}'
+    cmdty = '{http://www.gnucash.org/XML/cmdty}'
+    ts = '{http://www.gnucash.org/XML/ts}'
+
+    pricedb = PriceDB()
+    for child in tree.findall('price'):
+        commodity_space = child.find(price + 'commodity/' +
+                                     cmdty + 'space').text
+        commodity_name = child.find(price + 'commodity/' +
+                                    cmdty + 'id').text
+        currency_space = child.find(price + 'currency/' +
+                                    cmdty + 'space').text
+        currency_name = child.find(price + 'currency/' +
+                                   cmdty + 'id').text
+        date = child.find(price + 'time/' +
+                          ts + 'date').text
+        date = parse_date(date)
+        source = child.find(price + 'source').text
+        value = child.find(price + 'value').text
+        value = _parse_number(value)
+        price_obj = Price(commoditydict[(commodity_space, commodity_name)],
+                          commoditydict[(currency_space, currency_name)],
+                          date, source, value)
+        pricedb.add_price(price_obj)
+    return pricedb
+
 
 def _parse_number(numstring):
     num, denum = numstring.split("/")

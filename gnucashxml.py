@@ -31,13 +31,15 @@ class Book(object):
     A book is the main container for GNU Cash data.
 
     It doesn't really do anything at all by itself, except to have
-    a reference to the accounts, transactions, and commodities.
+    a reference to the accounts, transactions, prices, and commodities.
     """
-    def __init__(self, guid, transactions=None, root_account=None,
-                 commodities=None, slots=None):
+    def __init__(self, guid, prices=None, transactions=None, root_account=None,
+                 accounts=None, commodities=None, slots=None):
         self.guid = guid
+        self.prices = prices
         self.transactions = transactions or []
         self.root_account = root_account
+        self.accounts = accounts or []
         self.commodities = commodities or []
         self.slots = slots or {}
 
@@ -51,7 +53,31 @@ class Book(object):
         for account, children, splits in self.walk():
             if account.name == name:
                 return account
-
+    
+    def ledger(self):
+        outp = []
+        
+        for comm in self.commodities:
+            outp.append('commodity {}'.format(comm.name))
+            outp.append('\tnamespace {}'.format(comm.space))
+            outp.append('')
+    
+        for account in self.accounts:
+            outp.append('account {}'.format(account.fullname()))
+            if account.description:
+                outp.append('\tnote {}'.format(account.description))
+            outp.append('\tcheck commodity == "{}"'.format(account.commodity))
+            outp.append('')
+         
+        for trn in sorted(self.transactions):
+            outp.append('{:%Y/%m/%d} * {}'.format(trn.date, trn.description))
+            for spl in trn.splits:
+                outp.append('\t{:50} {:12.2f} {} {}'.format(spl.account.fullname(), spl.value, 
+                    spl.account.commodity, 
+                    '; '+spl.memo if spl.memo else ''))
+            outp.append('')
+        
+        return '\n'.join(outp)
 
 class Commodity(object):
     """
@@ -141,6 +167,7 @@ class Transaction(object):
         self.guid = guid
         self.currency = currency
         self.date = date
+        self.post_date = date             # for compatibility with piecash
         self.date_entered = date_entered
         self.description = description
         self.splits = splits or []
@@ -191,7 +218,34 @@ class Split(object):
             False
 
 
+class Price(object):
+    """
+    A price is GNUCASH record of the price of a commodity against a currency
+    Consists of date, currency, commodity,  value
+    """
+    def __init__(self, guid=None, commodity=None, currency=None,
+                 date=None, value=None):
+        self.guid = guid
+        self.commodity = commodity
+        self.currency = currency
+        self.date = date
+        self.value = value
 
+    def __repr__(self):
+        return "<Price {}... {:%d/%m/%Y}: 1 {} = {} {} >".format(self.guid[:6],
+            self.date,
+            self.commodity,
+            self.value,
+            self.currency)
+
+    def __lt__(self, other):
+        # For sorted() only
+        if isinstance(other, Price):
+            return self.date < other.date
+        else:
+            False
+            
+            
 ##################################################################
 # XML file parsing
 
@@ -242,7 +296,15 @@ def _book_from_tree(tree):
         commodities.append(comm)
         commoditydict[(comm.space, comm.name)] = comm
 
+    prices = []
+    t = tree.find('{http://www.gnucash.org/XML/gnc}pricedb')
+    if t:
+        for child in t.findall('price'):
+            price = _price_from_tree(child, commoditydict)
+            prices.append(price)
+    
     root_account = None
+    accounts = []
     accountdict = {}
     parentdict = {}
     for child in tree.findall('{http://www.gnucash.org/XML/gnc}account'):
@@ -256,6 +318,7 @@ def _book_from_tree(tree):
             parent = accountdict[parentdict[acc.guid]]
             acc.parent = parent
             parent.children.append(acc)
+            accounts.append(acc)
 
     transactions = []
     for child in tree.findall('{http://www.gnucash.org/XML/gnc}'
@@ -264,11 +327,14 @@ def _book_from_tree(tree):
                                                    accountdict,
                                                    commoditydict))
 
+    
     slots = _slots_from_tree(
         tree.find('{http://www.gnucash.org/XML/book}slots'))
     return Book(guid=guid,
+                prices=prices,
                 transactions=transactions,
                 root_account=root_account,
+                accounts=accounts,
                 commodities=commodities,
                 slots=slots)
 
@@ -289,7 +355,36 @@ def _commodity_from_tree(tree):
     space = tree.find('{http://www.gnucash.org/XML/cmdty}space').text
     return Commodity(name=name, space=space)
 
-
+# Implemented:
+# - price
+# - price:guid
+# - price:commodity
+# - price:currency
+# - price:date
+# - price:value
+def _price_from_tree(tree, commoditydict):
+    price = '{http://www.gnucash.org/XML/price}'
+    cmdty = '{http://www.gnucash.org/XML/cmdty}'
+    ts = "{http://www.gnucash.org/XML/ts}"
+    
+    guid = tree.find(price + 'id').text
+    value = _parse_number(tree.find(price + 'value').text)
+    date = parse_date(tree.find(price + 'time/' + ts + 'date').text)
+    
+    currency_space = tree.find(price + "currency/" + cmdty + "space").text
+    currency_name = tree.find(price + "currency/" + cmdty + "id").text
+    currency = commoditydict[(currency_space, currency_name)]
+    
+    commodity_space = tree.find(price + "commodity/" + cmdty + "space").text
+    commodity_name = tree.find(price + "commodity/" + cmdty + "id").text
+    commodity = commoditydict[(commodity_space, commodity_name)]
+    
+    return Price(guid = guid, 
+                 commodity = commodity, 
+                 date = date, 
+                 value = value, 
+                 currency = currency)
+                 
 # Implemented:
 # - act:name
 # - act:id
